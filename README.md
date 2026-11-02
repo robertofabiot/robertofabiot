@@ -5,7 +5,7 @@
 
 <p align="left">
   <a href="https://committers.top/nicaragua#robertofabiot">
-    <img src="https://img.shields.io/endpoint?url=https://github.com/robertofabiot/robertofabiot/raw/output/top-percent.json" alt="GitHub Top % Nicaragua" />
+    <img src="https://raw.githubusercontent.com/robertofabiot/robertofabiot/output/top-percent.svg" alt="GitHub Top % Nicaragua" />
   </a>
   <img src="https://img.shields.io/badge/Arch_Linux-Niri_%2F_Wayland-1793D1?logo=arch-linux&logoColor=white" alt="Arch Linux" />
   <img src="https://img.shields.io/badge/borrow_checker-mostly_friends-DEA584?logo=rust&logoColor=white" alt="Rust" />
