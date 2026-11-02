@@ -1,16 +1,27 @@
-## Hi there 👋
+# Roberto Fabio Tercero · `@robertofabiot`
 
-<!--
-**robertofabiot/robertofabiot** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+> I like fast compilers, clean Linux setups, and software that actually runs in production.  
+> **Systems Engineering @ UAM** · **AI & Tech Coordinator @ LifePlants** · Managua, Nicaragua.
 
-Here are some ideas to get you started:
+<p align="left">
+  <!-- Este badge se actualiza solo cada vez que committers.top regenera la lista -->
+  <a href="https://committers.top/nicaragua#robertofabiot">
+    <img src="https://user-badge.committers.top/nicaragua/robertofabiot.svg" alt="committers.top rank" />
+  </a>
+  <!-- Este badge lee el archivo JSON que actualiza tu GitHub Action cada día con tu % exacto -->
+  <a href="https://committers.top/nicaragua#robertofabiot">
+    <img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/robertofabiot/robertofabiot/output/top-percent.json" alt="GitHub Top % Nicaragua" />
+  </a>
+  <img src="https://img.shields.io/badge/Arch_Linux-Niri_%2F_Wayland-1793D1?logo=arch-linux&logoColor=white" alt="Arch Linux" />
+  <img src="https://img.shields.io/badge/borrow_checker-mostly_friends-DEA584?logo=rust&logoColor=white" alt="Rust" />
+  <a href="https://www.linkedin.com/in/roberto-tercero">
+    <img src="https://img.shields.io/badge/LinkedIn-Roberto_Fabio_Tercero-0A66C2?logo=linkedin&logoColor=white" alt="LinkedIn" />
+  </a>
+</p>
 
-- 🔭 I’m currently working on ...
-- 🌱 I’m currently learning ...
-- 👯 I’m looking to collaborate on ...
-- 🤔 I’m looking for help with ...
-- 💬 Ask me about ...
-- 📫 How to reach me: ...
-- 😄 Pronouns: ...
-- ⚡ Fun fact: ...
--->
+```diff
++ Building async backend daemons & bots in Rust (Tokio, Teloxide, SQLite)
++ Simulating 3D robotics in the browser: Rock-n-Bot (Rust, Wasm, Three.js, Rapier.js) [Private]
++ Architecting full-stack platforms with Spring Boot 3, React & PostgreSQL
+! 1st Place Regional @ WRO 2026 (Senior Autonomous Robotics — Pybricks)
+- Still refusing to bloat my host OS (everything runs in Distrobox containers)
