@@ -18,10 +18,10 @@ jobs:
         with:
           github_user_name: ${{ github.repository_owner }}
           outputs: |
-            dist/github-contribution-grid-snake.svg
-            dist/github-contribution-grid-snake-dark.svg?palette=github-dark
+            dist/snake-light.svg
+            dist/snake-dark.svg?palette=github-dark
 
-      - name: Calculate Live Top % in Nicaragua
+      - name: Generate Live Top % Badge SVG
         run: |
           mkdir -p dist
           PAGE=$(curl -sL https://committers.top/nicaragua)
@@ -30,20 +30,12 @@ jobs:
           
           if [ "$RANK" != "null" ] && [ -n "$RANK" ] && [ "$RANK" -gt 0 ] 2>/dev/null; then
             PCT=$(awk "BEGIN {printf \"%.1f\", ($RANK / $TOTAL) * 100}")
-            MSG="Top ${PCT}% (#${RANK} of ${TOTAL})"
+            MSG="Top_${PCT}%25_(%23${RANK}_of_${TOTAL})"
           else
-            MSG="Top 0.8% (#25 of 3132)"
+            MSG="Top_0.8%25_(%2325_of_3132)"
           fi
 
-          cat <<EOF > dist/top-percent.json
-          {
-            "schemaVersion": 1,
-            "label": "Nicaragua GitHub",
-            "message": "$MSG",
-            "color": "2ea44f",
-            "namedLogo": "github"
-          }
-          EOF
+          curl -sL "https://img.shields.io/badge/Nicaragua_GitHub-${MSG}-2ea44f?logo=github&logoColor=white" -o dist/top-percent.svg
 
       - name: Push to output branch
         uses: crazy-max/ghaction-github-pages@v3.1.0
