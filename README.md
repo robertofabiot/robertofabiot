@@ -4,10 +4,6 @@
 > **Systems Engineering @ UAM** · **AI & Tech Coordinator @ LifePlants** · Managua, Nicaragua.
 
 <p align="left">
-  <!-- Este badge se actualiza solo cada vez que committers.top regenera la lista -->
-  <a href="https://committers.top/nicaragua#robertofabiot">
-    <img src="https://user-badge.committers.top/nicaragua/robertofabiot.svg" alt="committers.top rank" />
-  </a>
   <!-- Este badge lee el archivo JSON que actualiza tu GitHub Action cada día con tu % exacto -->
   <a href="https://committers.top/nicaragua#robertofabiot">
     <img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/robertofabiot/robertofabiot/output/top-percent.json" alt="GitHub Top % Nicaragua" />
