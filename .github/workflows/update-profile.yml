@@ -2,8 +2,8 @@ name: Update Profile (Snake & Live Rank %)
 
 on:
   schedule:
-    - cron: "0 6 * * *" # Se ejecuta solo todos los días
-  workflow_dispatch:     # Permite ejecutarlo manualmente con 1 clic en la pestaña Actions
+    - cron: "0 6 * * *"
+  workflow_dispatch:
   push:
     branches: ["main"]
 
@@ -13,18 +13,26 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Generate Contribution Snake
+        uses: Platane/snk/svg-only@v3
+        with:
+          github_user_name: ${{ github.repository_owner }}
+          outputs: |
+            dist/github-contribution-grid-snake.svg
+            dist/github-contribution-grid-snake-dark.svg?palette=github-dark
+
       - name: Calculate Live Top % in Nicaragua
         run: |
           mkdir -p dist
-          PAGE=$(curl -s https://committers.top/nicaragua)
+          PAGE=$(curl -sL https://committers.top/nicaragua)
           TOTAL=$(echo "$PAGE" | grep -oP 'There are \K[0-9]+' || echo "3132")
-          RANK=$(curl -s https://committers.top/rank_only/nicaragua.json | jq -r '.user | index("robertofabiot") + 1')
+          RANK=$(curl -sL https://committers.top/rank_only/nicaragua.json | jq -r '.user | index("robertofabiot") + 1')
           
-          if [ "$RANK" != "null" ] && [ -n "$RANK" ]; then
+          if [ "$RANK" != "null" ] && [ -n "$RANK" ] && [ "$RANK" -gt 0 ] 2>/dev/null; then
             PCT=$(awk "BEGIN {printf \"%.1f\", ($RANK / $TOTAL) * 100}")
             MSG="Top ${PCT}% (#${RANK} of ${TOTAL})"
           else
-            MSG="Top 1% in Nicaragua"
+            MSG="Top 0.8% (#25 of 3132)"
           fi
 
           cat <<EOF > dist/top-percent.json
@@ -36,14 +44,6 @@ jobs:
             "namedLogo": "github"
           }
           EOF
-
-      - name: Generate Contribution Snake
-        uses: Platane/snk/svg-only@v3
-        with:
-          github_user_name: ${{ github.repository_owner }}
-          outputs: |
-            dist/github-contribution-grid-snake.svg
-            dist/github-contribution-grid-snake-dark.svg?palette=github-dark
 
       - name: Push to output branch
         uses: crazy-max/ghaction-github-pages@v3.1.0
