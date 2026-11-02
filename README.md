@@ -20,3 +20,10 @@
 + Architecting full-stack platforms with Spring Boot 3, React & PostgreSQL
 ! 1st Place Regional @ WRO 2026 (Senior Autonomous Robotics — Pybricks)
 - Still refusing to bloat my host OS (everything runs in Distrobox containers)
+```
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/robertofabiot/robertofabiot/output/snake-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/robertofabiot/robertofabiot/output/snake-light.svg" />
+  <img alt="Contribution snake" src="https://raw.githubusercontent.com/robertofabiot/robertofabiot/output/snake-light.svg" />
+</picture>
