@@ -1,0 +1,73 @@
+name: Update UAM Snake Animation
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: update-snake-main
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  update-snake:
+    name: Generate and Deploy UAM Snake Animation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Generate procedural snake SVG
+        run: |
+          python3 scripts/generate_snake.py --hourly --output snake-uam.svg
+
+      - name: Verify SVG integrity
+        run: |
+          python3 -c "
+          import xml.etree.ElementTree as ET
+          import sys
+
+          try:
+              tree = ET.parse('snake-uam.svg')
+              root = tree.getroot()
+          except Exception as e:
+              print(f'XML parsing failed: {e}', file=sys.stderr)
+              sys.exit(1)
+
+          scripts = root.findall('.//{http://www.w3.org/2000/svg}script') + root.findall('.//script')
+          if len(scripts) != 0:
+              print(f'Security violation: found {len(scripts)} <script> tags', file=sys.stderr)
+              sys.exit(1)
+
+          with open('snake-uam.svg', 'r', encoding='utf-8') as f:
+              raw = f.read()
+              if '<script' in raw.lower():
+                  print('Security violation: found <script in raw SVG content', file=sys.stderr)
+                  sys.exit(1)
+
+          print('SVG integrity check passed successfully (valid XML, 0 <script> tags).')
+          "
+
+      - name: Commit and push updated SVG
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add snake-uam.svg
+          if git diff --staged --quiet; then
+            echo "No changes in snake-uam.svg to commit."
+          else
+            SEED=$(date -u +%Y%m%d%H)
+            git commit -m "chore(snake): procedural match seed #${SEED} [skip ci]"
+            git push origin main
+          fi
