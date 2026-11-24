@@ -542,6 +542,26 @@ class TestTier3CLIGeneratorAndMechanics(BaseE2ETestCase):
             "Expected generator to fail on invalid --seed argument, but exited with code 0"
         )
 
+    def test_07_drones_never_touch_snake_body(self):
+        """Verify no drone ever overlaps any snake segment (head or tail) across many seeds."""
+        sys.path.insert(0, os.path.dirname(GENERATOR_PATH))
+        try:
+            import generate_snake
+        finally:
+            sys.path.pop(0)
+
+        for seed in list(range(40)) + [2026112300 + h for h in range(24)]:
+            sim = generate_snake.simulate_match(seed)
+            contacts = generate_snake.find_drone_contacts(
+                sim["history"], sim["d_alpha_col"], sim["d_beta_row"]
+            )
+            self.assertEqual(contacts, [], f"Seed {seed}: drone touched the snake at steps {contacts}")
+
+    def test_08_no_seed_in_rendered_svg(self):
+        """Verify the match seed is not displayed in the generated SVG."""
+        content = self.read_svg_text(SVG_PATH)
+        self.assertNotIn("SEED", content.upper(), "Seed indicator should not be rendered in the SVG")
+
 
 class TestTier4WorkflowAutomation(BaseE2ETestCase):
     """Tier 4: GitHub Actions Workflow Automation, Cron Schedule & Safety."""

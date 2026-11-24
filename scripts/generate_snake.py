@@ -7,10 +7,12 @@ Visual Composition:
 - ViewBox: 0 0 750 400 with 100% transparent root background.
 - Upper Section (Terminal Window): Crisp monospace console styling, window buttons,
   pure SMIL typewriter animation displaying confirmed user profile & UAM Virtual commands.
-- Middle Section (HUD Bar): Retro score counter updating +100 per apple, live status telemetry badge,
-  and match seed indicator.
-- Lower Section (Snake Arena): 30x7 grid, 15 snake segments with directional eyes, procedural apples,
-  burst shockwaves, and 2 patrolling neon sentinel drones with spatio-temporal BFS evasion.
+  Prompt and command share a single <text> run, so nothing overlaps whatever monospace
+  font the viewer ends up with.
+- Middle Section (HUD Bar): Retro score counter updating +100 per apple and live status badge.
+- Lower Section (Snake Arena): 30x7 grid, up to 15 snake segments with directional eyes,
+  procedural apples, burst shockwaves, and 2 patrolling neon sentinel drones. The whole
+  body (not just the head) is planned around the drones, so they never touch the snake.
 
 Zero JavaScript, Pure W3C SMIL Animation (<animate>, <animateTransform>, <clipPath>).
 """
@@ -18,7 +20,8 @@ Zero JavaScript, Pure W3C SMIL Animation (<animate>, <animateTransform>, <clipPa
 import argparse
 from collections import deque
 import datetime
-import math
+import heapq
+import itertools
 import os
 import random
 import sys
@@ -35,13 +38,20 @@ SEG_SIZE = 19
 OFFSET = (CELL_SIZE - SEG_SIZE) / 2 # 2.0px
 
 ARENA_X = 20
-ARENA_Y = 202
+ARENA_Y = 219
 ARENA_W = 710
-ARENA_H = 186
+ARENA_H = 171
 GRID_ORIGIN_X = ARENA_X + (ARENA_W - GRID_W * CELL_SIZE) / 2 # 30.0 px
-GRID_ORIGIN_Y = ARENA_Y + (ARENA_H - GRID_H * CELL_SIZE) / 2 # 214.5 px
+GRID_ORIGIN_Y = ARENA_Y + (ARENA_H - GRID_H * CELL_SIZE) / 2 # 224.0 px
 
 DIRS = [(1, 0), (0, 1), (-1, 0), (0, -1)]
+
+# Drones have periods 8 and 12 -> the arena state repeats every 24 steps.
+DRONE_PERIOD = 24
+MAX_MATCH_ATTEMPTS = 60
+MAX_SEARCH_EXPANSIONS = 40000
+
+FONT = 'font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"'
 
 APPLE_PALETTE = [
     "#ff5f56", # Neon Red
@@ -76,76 +86,108 @@ def get_drone_obstacles(step, d_alpha_col, d_beta_row):
         drone_beta_pos(step, row=d_beta_row),
     }
 
-# --- Spatio-Temporal Pathfinder ---
-def find_path_spatiotemporal(start_pos, goal_pos, initial_body, start_step, d_alpha_col, d_beta_row, max_depth=350):
+# --- Snake Mechanics ---
+def in_arena(cell):
+    return 0 <= cell[0] < GRID_W and 0 <= cell[1] < GRID_H
+
+def advance(body, cell, growth):
+    """Moves the snake one cell. Returns (new_body, new_growth)."""
+    if growth > 0:
+        return (cell,) + body, growth - 1
+    return (cell,) + body[:-1], growth
+
+def move_is_clear(body, new_body, step, d_alpha_col, d_beta_row):
     """
-    Spatio-temporal BFS in (x, y, t) state space.
-    Avoids moving drones at time t+1 and snake body segments at time t+1.
+    True if no drone touches any snake segment while moving from `step` to `step + 1`.
+    Segments interpolate linearly between cells, so a drone must neither land on a cell the
+    snake occupies before or after the move, nor leave a cell the snake is moving into.
     """
-    # queue elements: (current_pos, step, path, body)
-    queue = deque([(start_pos, start_step, [start_pos], list(initial_body))])
-    # Drones have periods 8 and 12 -> LCM is 24.
-    visited = {(start_pos, start_step % 24)}
+    drones_now = get_drone_obstacles(step, d_alpha_col, d_beta_row)
+    drones_next = get_drone_obstacles(step + 1, d_alpha_col, d_beta_row)
+    old_cells = set(body)
+    new_cells = set(new_body)
+    return not (drones_next & (old_cells | new_cells)) and not (drones_now & new_cells)
 
-    while queue:
-        curr, step, path, body = queue.popleft()
-        if curr == goal_pos:
-            return path
-
-        if step - start_step > max_depth:
-            break
-
-        next_step = step + 1
-        d_obs = get_drone_obstacles(next_step, d_alpha_col, d_beta_row)
-        body_obs = set(body[:-1])
-
-        # Try neighbors; prioritize moves reducing Manhattan distance to goal
-        neighbors = []
+def free_space(body, limit):
+    """Flood-fill reach from the head, capped at `limit`, treating the body as walls."""
+    head = body[0]
+    walls = set(body[1:])
+    seen = {head}
+    queue = deque([head])
+    while queue and len(seen) < limit:
+        cx, cy = queue.popleft()
         for dx, dy in DIRS:
-            nx, ny = curr[0] + dx, curr[1] + dy
-            if 0 <= nx < GRID_W and 0 <= ny < GRID_H:
-                if (nx, ny) not in d_obs and (nx, ny) not in body_obs:
-                    dist = abs(nx - goal_pos[0]) + abs(ny - goal_pos[1])
-                    neighbors.append((dist, (nx, ny)))
+            nxt = (cx + dx, cy + dy)
+            if in_arena(nxt) and nxt not in seen and nxt not in walls:
+                seen.add(nxt)
+                queue.append(nxt)
+    return len(seen)
 
-        neighbors.sort(key=lambda item: item[0])
-
-        for _, next_cell in neighbors:
-            state_key = (next_cell, next_step % 24)
-            if state_key not in visited:
-                visited.add(state_key)
-                new_body = [next_cell] + body[:-1]
-                queue.append((next_cell, next_step, path + [next_cell], new_body))
-
-    # Fallback heuristic: choose move maximizing free space if direct path blocked
-    best_next = None
-    best_score = -1
-    curr = start_pos
-    next_step = start_step + 1
-    d_obs = get_drone_obstacles(next_step, d_alpha_col, d_beta_row)
-    body_obs = set(initial_body[:-1])
-
+def can_survive(body, growth, step, depth, d_alpha_col, d_beta_row, budget=None):
+    """True if the snake has `depth` collision-free moves ahead of it (bounded DFS)."""
+    budget = budget if budget is not None else [3000]
+    if depth == 0:
+        return True
+    if budget[0] <= 0:
+        return False
+    budget[0] -= 1
+    hx, hy = body[0]
     for dx, dy in DIRS:
-        nx, ny = curr[0] + dx, curr[1] + dy
-        if 0 <= nx < GRID_W and 0 <= ny < GRID_H and (nx, ny) not in d_obs and (nx, ny) not in body_obs:
-            # Measure flood fill reach
-            q = deque([(nx, ny)])
-            v = {curr, (nx, ny)} | body_obs | d_obs
-            score = 0
-            while q and score < 50:
-                cx, cy = q.popleft()
-                score += 1
-                for ddx, ddy in DIRS:
-                    nnx, nny = cx + ddx, cy + ddy
-                    if 0 <= nnx < GRID_W and 0 <= nny < GRID_H and (nnx, nny) not in v:
-                        v.add((nnx, nny))
-                        q.append((nnx, nny))
-            if score > best_score:
-                best_score = score
-                best_next = (nx, ny)
+        cell = (hx + dx, hy + dy)
+        if not in_arena(cell):
+            continue
+        new_body, new_growth = advance(body, cell, growth)
+        if cell in new_body[1:] or not move_is_clear(body, new_body, step, d_alpha_col, d_beta_row):
+            continue
+        if can_survive(new_body, new_growth, step + 1, depth - 1, d_alpha_col, d_beta_row, budget):
+            return True
+    return False
 
-    if best_next is not None:
-        return [start_pos, best_next]
+# --- Spatio-Temporal Pathfinder ---
+def plan_route(body, step, growth, is_goal, heuristic, d_alpha_col, d_beta_row, allow_offscreen=False):
+    """
+    A* in (body, t mod 24, growth) state space.
+    Every move is validated against both drones for the full body, not just the head.
+    With `allow_offscreen`, the head may slide off the right edge (exit phase) but only
+    keeps moving straight once it is out.
+    Returns the list of (body, growth) states after each move, or None.
+    """
+    tie = itertools.count()
+    start = (tuple(body), growth)
+    heap = [(heuristic(start[0]), next(tie), start, step, None)]
+    seen = {(start[0], step % DRONE_PERIOD, growth)}
+    expansions = 0
+
+    while heap and expansions < MAX_SEARCH_EXPANSIONS:
+        _, _, state, t, parent = heapq.heappop(heap)
+        node = (state, parent)
+        expansions += 1
+        cur_body, cur_growth = state
+        g = t - step
+
+        if g > 0 and is_goal(cur_body, cur_growth, t):
+            route = []
+            while node[1] is not None:
+                route.append(node[0])
+                node = node[1]
+            return route[::-1]
+
+        hx, hy = cur_body[0]
+        moves = [(1, 0)] if not in_arena(cur_body[0]) else DIRS
+        for dx, dy in moves:
+            cell = (hx + dx, hy + dy)
+            if not in_arena(cell) and not (allow_offscreen and cell[0] >= GRID_W and 0 <= cell[1] < GRID_H):
+                continue
+            new_body, new_growth = advance(cur_body, cell, cur_growth)
+            if cell in new_body[1:]:
+                continue
+            if not move_is_clear(cur_body, new_body, t, d_alpha_col, d_beta_row):
+                continue
+            key = (new_body, (t + 1) % DRONE_PERIOD, new_growth)
+            if key in seen:
+                continue
+            seen.add(key)
+            heapq.heappush(heap, (g + 1 + heuristic(new_body), next(tie), (new_body, new_growth), t + 1, node))
 
     return None
 
@@ -170,8 +212,9 @@ def generate_apples(rng, d_alpha_col, d_beta_row, count=7):
         candidates = []
         for c in range(c_min, c_max + 1):
             for r in range(r_min, r_max + 1):
-                if (c, r) not in chosen_coords and (c, r) != (d_alpha_col, 3) and (c, r) != (21, d_beta_row):
-                    candidates.append((c, r))
+                if (c, r) in chosen_coords or c == d_alpha_col or (r == d_beta_row and 18 <= c <= 24):
+                    continue
+                candidates.append((c, r))
         pos = rng.choice(candidates) if candidates else (c_min, r_min)
         chosen_coords.add(pos)
         apples.append({
@@ -183,140 +226,264 @@ def generate_apples(rng, d_alpha_col, d_beta_row, count=7):
     return apples
 
 # --- Match Simulation ---
-def simulate_match(seed, apple_count=7):
+def find_drone_contacts(history, d_alpha_col, d_beta_row):
+    """Returns every step at which a drone touches any snake segment (empty list = clean match)."""
+    contacts = []
+    for k in range(len(history) - 1):
+        if not move_is_clear(tuple(history[k]), tuple(history[k + 1]), k, d_alpha_col, d_beta_row):
+            contacts.append(k)
+    return contacts
+
+def status_for(head, step, apple_idx, d_alpha_col, d_beta_row):
+    d_alpha = drone_alpha_pos(step, d_alpha_col)
+    d_beta = drone_beta_pos(step, d_beta_row)
+    dist_alpha = abs(head[0] - d_alpha[0]) + abs(head[1] - d_alpha[1])
+    dist_beta = abs(head[0] - d_beta[0]) + abs(head[1] - d_beta[1])
+    if dist_alpha <= 2 or dist_beta <= 2:
+        return ("EVADE", "EVADING NEON DRONE")
+    return ("HUNT", f"HUNTING APPLE #{apple_idx + 1}")
+
+def play_match(apples_spec, d_alpha_col, d_beta_row):
     """
-    Simulates a full deterministic match:
+    Plays one deterministic match:
     1. Snake enters from off-screen left.
     2. Navigates past Drone Alpha and Beta eating procedural apples.
     3. Snake length dynamically grows up to 15 segments.
-    4. Snake gracefully exits off-screen right.
+    4. Snake exits off-screen right, then drones keep patrolling until their cycle closes
+       so the loop restarts seamlessly.
+    Returns None if the snake cannot finish cleanly.
     """
-    rng = random.Random(seed)
-    d_alpha_col = rng.choice([9, 10])
-    d_beta_row = rng.choice([3, 4])
-
-    apples_spec = generate_apples(rng, d_alpha_col, d_beta_row, count=apple_count)
-
     # Initial snake off-screen to the left facing east
     start_row = apples_spec[0]["pos"][1]
-    snake = [(-1, start_row), (-2, start_row), (-3, start_row), (-4, start_row)]
-    history = [list(snake)]
+    body = tuple((-1 - i, start_row) for i in range(4))
+    growth = 0
+    history = [list(body)]
     apple_events = []
     status_timeline = [] # (step, status_type, extra_text)
-
-    current_step = 0
     spawn_step = 0
-    growth_pending = 0
 
     # Total growth needed: 15 - 4 = 11 segments
     # Apples: 7 apples -> [2, 2, 2, 1, 1, 1, 2] = 11
     growth_schedule = [2, 2, 2, 1, 1, 1, 2]
 
+    def record(route, apple_idx, label=None):
+        for new_body, new_growth in route:
+            step = len(history) - 1
+            if label:
+                status_timeline.append((step, "EXIT", label))
+            else:
+                status_timeline.append((step,) + status_for(history[-1][0], step, apple_idx, d_alpha_col, d_beta_row))
+            history.append(list(new_body))
+        return route[-1]
+
     for apple_idx, apple in enumerate(apples_spec):
-        apple_pos = apple["pos"]
-        color = apple["color"]
+        goal = apple["pos"]
         grow_amount = growth_schedule[apple_idx % len(growth_schedule)]
 
-        # Hunt current apple until head reaches it
-        while snake[0] != apple_pos:
-            head = snake[0]
+        def reached(b, gr, t, goal=goal, grow_amount=grow_amount):
+            # Only accept the apple if the snake can still get its whole body out of the drones' way
+            if b[0] != goal:
+                return False
+            needed = len(b) + gr + grow_amount
+            return (free_space(b, needed) >= needed
+                    and can_survive(b, gr + grow_amount, t, needed, d_alpha_col, d_beta_row))
 
-            # Determine live status: check proximity to any drone
-            d_alpha = drone_alpha_pos(current_step, d_alpha_col)
-            d_beta = drone_beta_pos(current_step, d_beta_row)
-            dist_alpha = abs(head[0] - d_alpha[0]) + abs(head[1] - d_alpha[1])
-            dist_beta = abs(head[0] - d_beta[0]) + abs(head[1] - d_beta[1])
+        def toward(b, goal=goal):
+            return abs(b[0][0] - goal[0]) + abs(b[0][1] - goal[1])
 
-            if dist_alpha <= 2 or dist_beta <= 2:
-                status_timeline.append((current_step, "EVADE", "EVADING NEON DRONE ⚠️"))
-            else:
-                status_timeline.append((current_step, "HUNT", f"HUNTING APPLE #{apple_idx + 1}"))
+        route = plan_route(body, len(history) - 1, growth, reached, toward, d_alpha_col, d_beta_row)
+        if route is None:
+            return None
+        body, growth = record(route, apple_idx)
 
-            if head[0] < 0:
-                # Entering from left
-                next_cell = (head[0] + 1, head[1])
-            else:
-                # Spatio-temporal search
-                path = find_path_spatiotemporal(head, apple_pos, snake, current_step, d_alpha_col, d_beta_row)
-                if path and len(path) >= 2:
-                    next_cell = path[1]
-                else:
-                    # Fallback straight move
-                    next_cell = (head[0] + 1, head[1])
+        eat_step = len(history) - 1
+        apple_events.append({
+            "idx": apple_idx,
+            "spawn_step": spawn_step,
+            "eat_step": eat_step,
+            "pos": goal,
+            "color": apple["color"],
+        })
+        spawn_step = eat_step + 1
+        status_timeline.append((eat_step, "EAT", "TARGET SECURED (+100)"))
+        growth += grow_amount
 
-            snake.insert(0, next_cell)
-            current_step += 1
+    # Exit phase: Snake navigates off-screen to the right
+    def fully_out(b, gr, t):
+        return all(x >= GRID_W for x, _ in b)
 
-            if growth_pending > 0:
-                growth_pending -= 1
-            else:
-                snake.pop()
+    def to_exit(b):
+        return max(0, GRID_W + len(b) - 1 - b[0][0])
 
-            if next_cell == apple_pos:
-                # Apple eaten!
-                history.append(list(snake))
-                eat_step = current_step
-                apple_events.append({
-                    "idx": apple_idx,
-                    "spawn_step": spawn_step,
-                    "eat_step": eat_step,
-                    "pos": apple_pos,
-                    "color": color,
-                })
-                spawn_step = current_step + 1
-                status_timeline.append((current_step, "EAT", "TARGET SECURED (+100)"))
-                growth_pending += grow_amount
-                break
-            else:
-                history.append(list(snake))
+    route = plan_route(body, len(history) - 1, growth, fully_out, to_exit,
+                       d_alpha_col, d_beta_row, allow_offscreen=True)
+    if route is None:
+        return None
+    body, growth = record(route, len(apples_spec), label="MISSION COMPLETE")
 
-    # Exit phase: Snake navigates off-screen to the right (x >= 31)
-    exit_row = snake[0][1]
-    while any(pt[0] < 31 for pt in snake):
-        hx, hy = snake[0]
-        status_timeline.append((current_step, "EXIT", "MISSION COMPLETE"))
-
-        # Guide smoothly towards exit lane without reversing into neck/body
-        neck = snake[1] if len(snake) > 1 else None
-        candidates = []
-        if hy < 3:
-            candidates.append((hx, hy + 1))
-        elif hy > 3:
-            candidates.append((hx, hy - 1))
-        candidates.append((hx + 1, hy))
-
-        chosen = None
-        for nx, ny in candidates:
-            if (nx, ny) != neck and (nx, ny) not in snake[1:]:
-                chosen = (nx, ny)
-                break
-        if chosen is None:
-            chosen = (hx + 1, hy)
-        nx, ny = chosen
-
-        snake.insert(0, (nx, ny))
-        if growth_pending > 0:
-            growth_pending -= 1
-        else:
-            snake.pop()
-        current_step += 1
-        history.append(list(snake))
+    # Let the drones finish their patrol cycle so the loop seam is invisible
+    while (len(history) - 1) % DRONE_PERIOD != 0:
+        status_timeline.append((len(history) - 1, "EXIT", "MISSION COMPLETE"))
+        history.append(list(body))
 
     # Append terminal status for final step
-    status_timeline.append((current_step, "EXIT", "MISSION COMPLETE"))
+    status_timeline.append((len(history) - 1, "EXIT", "MISSION COMPLETE"))
 
-    return {
-        "seed": seed,
-        "history": history,
-        "apple_events": apple_events,
-        "status_timeline": status_timeline,
-        "d_alpha_col": d_alpha_col,
-        "d_beta_row": d_beta_row,
-    }
+    if find_drone_contacts(history, d_alpha_col, d_beta_row):
+        return None
+
+    return history, apple_events, status_timeline
+
+def simulate_match(seed, apple_count=7):
+    """Simulates a full deterministic match for `seed`, re-rolling the layout until it plays cleanly."""
+    rng = random.Random(seed)
+    for _ in range(MAX_MATCH_ATTEMPTS):
+        d_alpha_col = rng.choice([9, 10])
+        d_beta_row = rng.choice([3, 4])
+        apples_spec = generate_apples(rng, d_alpha_col, d_beta_row, count=apple_count)
+
+        result = play_match(apples_spec, d_alpha_col, d_beta_row)
+        if result is None:
+            continue
+
+        history, apple_events, status_timeline = result
+        return {
+            "seed": seed,
+            "history": history,
+            "apple_events": apple_events,
+            "status_timeline": status_timeline,
+            "d_alpha_col": d_alpha_col,
+            "d_beta_row": d_beta_row,
+        }
+
+    raise RuntimeError(f"Could not build a collision-free match for seed {seed}")
+
+# --- SMIL Helpers ---
+# Terminal script timing, in seconds of an 18s reference loop (scaled to --duration).
+TERM_REF = 18.0
+TERM_RESET = 17.5
+
+def fmt_kt(values):
+    return ";".join(f"{v:.5f}" for v in values)
+
+def window_keys(start, end, on, off):
+    """keyTimes/values for something shown from `start` to `end` seconds of the terminal script.
+    Items shown at t=0 are shown again after the reset, so the loop seam matches the first frame."""
+    kt = [0.0]
+    vals = [on if start <= 0 else off]
+    if start > 0:
+        kt.append(start / TERM_REF)
+        vals.append(on)
+    if end < TERM_RESET:
+        kt.append(end / TERM_REF)
+        vals.append(off)
+    kt.append(TERM_RESET / TERM_REF)
+    vals.append(on if start <= 0 else off)
+    kt.append(1.0)
+    vals.append(vals[-1])
+    return fmt_kt(kt), ";".join(vals)
+
+def discrete_anim(attr, total_time, start, end, on, off):
+    kt, vals = window_keys(start, end, on, off)
+    return (f'<animate attributeName="{attr}" dur="{total_time:.2f}s" repeatCount="indefinite" '
+            f'calcMode="discrete" keyTimes="{kt}" values="{vals}"/>')
+
+def esc(text):
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 # --- SMIL SVG Builder ---
+def build_terminal(total_time):
+    svg = []
+    svg.append('  <!-- ================= TERMINAL SECTION ================= -->')
+    svg.append('  <g id="terminal-window">')
+    # Terminal Window Container
+    svg.append('    <rect x="20" y="10" width="710" height="176" rx="8" ry="8" '
+               'fill="#0d1117" fill-opacity="0.80" stroke="#30363d" stroke-width="1"/>')
+    # Window Title Bar
+    svg.append('    <path d="M 20 18 A 8 8 0 0 1 28 10 L 722 10 A 8 8 0 0 1 730 18 L 730 32 L 20 32 Z" '
+               'fill="#161b22" fill-opacity="0.85"/>')
+    svg.append('    <line x1="20" y1="32" x2="730" y2="32" stroke="#30363d" stroke-width="1"/>')
+
+    # Window Controls (Red, Yellow, Green)
+    svg.append('    <circle cx="36" cy="21" r="4.2" fill="#ff5f56"/>')
+    svg.append('    <circle cx="50" cy="21" r="4.2" fill="#ffbd2e"/>')
+    svg.append('    <circle cx="64" cy="21" r="4.2" fill="#27c93f"/>')
+
+    # Title Bar Text
+    svg.append(f'    <text x="375" y="25" {FONT} font-size="11" fill="#8b949e" text-anchor="middle">'
+               'robertofabiot@uam-virtual:~</text>')
+
+    prompt_text = "[ro@archlinux ~]$ "
+    prompt = ('<tspan fill="#58a6ff">[ro@archlinux</tspan><tspan fill="#8b949e"> </tspan>'
+              '<tspan fill="#3fb950">~</tspan><tspan fill="#8b949e">]$ </tspan>')
+
+    # (command, prompt_at, type_start, type_end, output_at, output lines)
+    script = [
+        ("whoami", 0.0, 0.3, 1.2, 1.5, [
+            ('#f0f6fc', 'Roberto Fabio Tercero <tspan fill="#58a6ff">· @robertofabiot</tspan>'),
+            ('#8b949e', '<tspan fill="#3fb950">↳</tspan> Ingeniería en Sistemas @ '
+                        '<tspan fill="#e6edf3">Universidad Americana (UAM)</tspan>'),
+        ]),
+        ("uam-virtual --status", 3.2, 3.5, 5.2, 5.4, [
+            ('#f0f6fc', '<tspan fill="#3fb950">● Conectado:</tspan> '
+                        '<tspan fill="#79c0ff">uamvirtual.uam.edu.ni/grado</tspan>'),
+            ('#8b949e', '<tspan fill="#3fb950">↳</tspan> Cursos activos: '
+                        '<tspan fill="#ffa657">BD2</tspan> · <tspan fill="#ffa657">Prog. Escritorio</tspan> · '
+                        '<tspan fill="#ffa657">Redes II</tspan> · <tspan fill="#ffa657">Ed. Ambiental</tspan>'),
+        ]),
+        ("fastfetch --stack", 7.5, 7.8, 9.4, 9.6, [
+            ('#f0f6fc', '<tspan fill="#d2a8ff">OS:</tspan> Arch Linux x86_64 · '
+                        '<tspan fill="#d2a8ff">WM:</tspan> Niri (Wayland)'),
+            ('#8b949e', '<tspan fill="#58a6ff">Stack:</tspan> '
+                        '<tspan fill="#ff7b72">Rust</tspan> · <tspan fill="#3fb950">Python</tspan> · '
+                        '<tspan fill="#ffa657">Java</tspan> · <tspan fill="#58a6ff">Linux</tspan>'),
+        ]),
+        # Idle prompt waiting for the next command
+        ("", 10.2, 10.2, 10.2, None, []),
+    ]
+
+    line_h = 13.0
+    block_gap = 3.0
+    y = 48.0
+    for i, (cmd, prompt_at, type_start, type_end, output_at, outputs) in enumerate(script):
+        next_prompt = script[i + 1][1] if i + 1 < len(script) else TERM_RESET
+
+        # Command characters are revealed one by one with `display`, so the cursor that
+        # follows them in the same text run always sits right after the last typed char.
+        typed = []
+        for c_idx, ch in enumerate(cmd):
+            t_char = type_start + (type_end - type_start) * c_idx / max(1, len(cmd) - 1)
+            typed.append(f'<tspan display="none">{discrete_anim("display", total_time, t_char, TERM_RESET, "inline", "none")}'
+                         f'{esc(ch)}</tspan>')
+        cursor = (f'<tspan fill="#58a6ff" display="none">'
+                  f'{discrete_anim("display", total_time, prompt_at, next_prompt, "inline", "none")}'
+                  '<animate attributeName="fill-opacity" values="1;0" calcMode="discrete" dur="1s" repeatCount="indefinite"/>'
+                  '▋</tspan>')
+
+        svg.append(f'    <!-- Prompt {i + 1} -->')
+        prompt_visibility = "" if prompt_at <= 0 else ' opacity="0"'
+        svg.append(f'    <text x="36" y="{y:.1f}" {FONT} font-size="11.5" xml:space="preserve" '
+                   f'aria-label="{esc(prompt_text + cmd).strip()}"{prompt_visibility}>'
+                   + ("" if prompt_at <= 0 else discrete_anim("opacity", total_time, prompt_at, TERM_RESET, "1", "0"))
+                   + prompt
+                   + f'<tspan font-weight="bold" fill="#f0f6fc">{"".join(typed)}</tspan>'
+                   + cursor
+                   + '</text>')
+        y += line_h
+
+        if outputs:
+            svg.append('    <g opacity="0">')
+            svg.append('      ' + discrete_anim("opacity", total_time, output_at, TERM_RESET, "1", "0"))
+            for fill, markup in outputs:
+                svg.append(f'      <text x="36" y="{y:.1f}" {FONT} font-size="11.5" fill="{fill}">{markup}</text>')
+                y += line_h
+            svg.append('    </g>')
+        y += block_gap
+
+    svg.append('  </g>')
+    return svg
+
 def build_svg(sim_data, total_duration=18.0):
-    seed = sim_data["seed"]
     history = sim_data["history"]
     apple_events = sim_data["apple_events"]
     status_timeline = sim_data["status_timeline"]
@@ -354,192 +521,29 @@ def build_svg(sim_data, total_duration=18.0):
     svg.append('    <filter id="glow-drone-beta" x="-30%" y="-30%" width="160%" height="160%">')
     svg.append('      <feDropShadow dx="0" dy="0" stdDeviation="2.0" flood-color="#58a6ff" flood-opacity="0.7"/>')
     svg.append('    </filter>')
-
-    # Typewriter ClipPaths for Commands
-    # Prompt is at x=36. Length of prompt "[ro@archlinux ~]$ " is ~134px. Command starts at x=170.
-    # Command 1: "whoami" (w ~ 48px)
-    svg.append('    <clipPath id="clip-cmd1">')
-    svg.append(f'      <rect x="170" y="36" width="0" height="15">')
-    svg.append(f'        <animate attributeName="width" dur="{total_time:.2f}s" repeatCount="indefinite" ')
-    svg.append(f'                 keyTimes="0.00000;0.01667;0.06667;0.97222;1.00000" values="0;0;50;50;0"/>')
-    svg.append('      </rect>')
-    svg.append('    </clipPath>')
-
-    # Command 2: "uam-virtual --status" (w ~ 158px)
-    svg.append('    <clipPath id="clip-cmd2">')
-    svg.append(f'      <rect x="170" y="75" width="0" height="15">')
-    svg.append(f'        <animate attributeName="width" dur="{total_time:.2f}s" repeatCount="indefinite" ')
-    svg.append(f'                 keyTimes="0.00000;0.19444;0.28889;0.97222;1.00000" values="0;0;160;160;0"/>')
-    svg.append('      </rect>')
-    svg.append('    </clipPath>')
-
-    # Command 3: "fastfetch --stack" (w ~ 138px)
-    svg.append('    <clipPath id="clip-cmd3">')
-    svg.append(f'      <rect x="170" y="114" width="0" height="15">')
-    svg.append(f'        <animate attributeName="width" dur="{total_time:.2f}s" repeatCount="indefinite" ')
-    svg.append(f'                 keyTimes="0.00000;0.43333;0.52222;0.97222;1.00000" values="0;0;140;140;0"/>')
-    svg.append('      </rect>')
-    svg.append('    </clipPath>')
     svg.append('  </defs>')
 
     # ==========================================
-    # SECTION 1: UPPER TERMINAL WINDOW (y=10..158)
-    # 100% Transparent Canvas: Floating dark translucent console window
+    # SECTION 1: UPPER TERMINAL WINDOW (y=10..186)
     # ==========================================
-    svg.append('  <!-- ================= TERMINAL SECTION ================= -->')
-    svg.append('  <g id="terminal-window">')
-    # Terminal Window Container
-    svg.append('    <rect x="20" y="10" width="710" height="148" rx="8" ry="8" '
-               'fill="#0d1117" fill-opacity="0.80" stroke="#30363d" stroke-width="1"/>')
-    # Window Title Bar
-    svg.append('    <path d="M 20 18 A 8 8 0 0 1 28 10 L 722 10 A 8 8 0 0 1 730 18 L 730 32 L 20 32 Z" '
-               'fill="#161b22" fill-opacity="0.85"/>')
-    svg.append('    <line x1="20" y1="32" x2="730" y2="32" stroke="#30363d" stroke-width="1"/>')
-
-    # Window Controls (Red, Yellow, Green)
-    svg.append('    <circle cx="36" cy="21" r="4.2" fill="#ff5f56"/>')
-    svg.append('    <circle cx="50" cy="21" r="4.2" fill="#ffbd2e"/>')
-    svg.append('    <circle cx="64" cy="21" r="4.2" fill="#27c93f"/>')
-
-    # Title Bar Text
-    svg.append('    <text x="375" y="25" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" '
-               'font-size="11" fill="#8b949e" text-anchor="middle">robertofabiot@uam-virtual:~</text>')
-
-    # --- Line 1: whoami ---
-    # Prompt 1
-    svg.append('    <text x="36" y="47" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" '
-               'font-size="11.5" xml:space="preserve">')
-    svg.append('      <tspan fill="#58a6ff">[ro@archlinux</tspan><tspan fill="#8b949e"> </tspan>'
-               '<tspan fill="#3fb950">~</tspan><tspan fill="#8b949e">]$ </tspan>')
-    svg.append('    </text>')
-    # Typed Command 1
-    svg.append('    <g clip-path="url(#clip-cmd1)">')
-    svg.append('      <text x="170" y="47" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" '
-               'font-size="11.5" font-weight="bold" fill="#f0f6fc">whoami</text>')
-    svg.append('    </g>')
-    # Output 1 (Discrete opacity transition at t=1.3s / 18.0s = 0.07222)
-    svg.append('    <g opacity="0">')
-    svg.append(f'      <animate attributeName="opacity" dur="{total_time:.2f}s" repeatCount="indefinite" calcMode="discrete" '
-               f'keyTimes="0.00000;0.07222;0.97222;1.00000" values="0;1;0;0"/>')
-    svg.append('      <text x="36" y="59" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" '
-               'font-size="11.5" fill="#f0f6fc">Roberto Fabio Tercero <tspan fill="#58a6ff">· @robertofabiot</tspan></text>')
-    svg.append('      <text x="36" y="71" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" '
-               'font-size="11.5" fill="#8b949e"><tspan fill="#3fb950">↳</tspan> Ingeniería en Sistemas @ '
-               '<tspan fill="#e6edf3">Universidad Americana (UAM)</tspan></text>')
-    svg.append('    </g>')
-
-    # --- Line 2: uam-virtual --status ---
-    # Prompt 2 appears at t=3.2s / 18.0s = 0.17778
-    svg.append('    <g opacity="0">')
-    svg.append(f'      <animate attributeName="opacity" dur="{total_time:.2f}s" repeatCount="indefinite" calcMode="discrete" '
-               f'keyTimes="0.00000;0.17778;0.97222;1.00000" values="0;1;0;0"/>')
-    svg.append('      <text x="36" y="86" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" '
-               'font-size="11.5" xml:space="preserve">')
-    svg.append('        <tspan fill="#58a6ff">[ro@archlinux</tspan><tspan fill="#8b949e"> </tspan>'
-               '<tspan fill="#3fb950">~</tspan><tspan fill="#8b949e">]$ </tspan>')
-    svg.append('      </text>')
-    svg.append('    </g>')
-    # Typed Command 2
-    svg.append('    <g clip-path="url(#clip-cmd2)">')
-    svg.append('      <text x="170" y="86" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" '
-               'font-size="11.5" font-weight="bold" fill="#f0f6fc">uam-virtual --status</text>')
-    svg.append('    </g>')
-    # Output 2 appears at t=5.4s / 18.0s = 0.30000
-    svg.append('    <g opacity="0">')
-    svg.append(f'      <animate attributeName="opacity" dur="{total_time:.2f}s" repeatCount="indefinite" calcMode="discrete" '
-               f'keyTimes="0.00000;0.30000;0.97222;1.00000" values="0;1;0;0"/>')
-    svg.append('      <text x="36" y="98" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" '
-               'font-size="11.5" fill="#f0f6fc"><tspan fill="#3fb950">● Conectado:</tspan> '
-               '<tspan fill="#79c0ff">uamvirtual.uam.edu.ni/grado</tspan></text>')
-    svg.append('      <text x="36" y="110" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" '
-               'font-size="11.5" fill="#8b949e"><tspan fill="#3fb950">↳</tspan> Cursos activos: '
-               '<tspan fill="#ffa657">BD2</tspan> · <tspan fill="#ffa657">Prog. Escritorio</tspan> · '
-               '<tspan fill="#ffa657">Redes II</tspan> · <tspan fill="#ffa657">Ed. Ambiental</tspan></text>')
-    svg.append('    </g>')
-
-    # --- Line 3: fastfetch --stack ---
-    # Prompt 3 appears at t=7.5s / 18.0s = 0.41667
-    svg.append('    <g opacity="0">')
-    svg.append(f'      <animate attributeName="opacity" dur="{total_time:.2f}s" repeatCount="indefinite" calcMode="discrete" '
-               f'keyTimes="0.00000;0.41667;0.97222;1.00000" values="0;1;0;0"/>')
-    svg.append('      <text x="36" y="125" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" '
-               'font-size="11.5" xml:space="preserve">')
-    svg.append('        <tspan fill="#58a6ff">[ro@archlinux</tspan><tspan fill="#8b949e"> </tspan>'
-               '<tspan fill="#3fb950">~</tspan><tspan fill="#8b949e">]$ </tspan>')
-    svg.append('      </text>')
-    svg.append('    </g>')
-    # Typed Command 3
-    svg.append('    <g clip-path="url(#clip-cmd3)">')
-    svg.append('      <text x="170" y="125" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" '
-               'font-size="11.5" font-weight="bold" fill="#f0f6fc">fastfetch --stack</text>')
-    svg.append('    </g>')
-    # Output 3 appears at t=9.6s / 18.0s = 0.53333
-    svg.append('    <g opacity="0">')
-    svg.append(f'      <animate attributeName="opacity" dur="{total_time:.2f}s" repeatCount="indefinite" calcMode="discrete" '
-               f'keyTimes="0.00000;0.53333;0.97222;1.00000" values="0;1;0;0"/>')
-    svg.append('      <text x="36" y="137" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" '
-               'font-size="11.5" fill="#f0f6fc"><tspan fill="#d2a8ff">OS:</tspan> Arch Linux x86_64 · '
-               '<tspan fill="#d2a8ff">WM:</tspan> Niri (Wayland)</text>')
-    svg.append('      <text x="36" y="149" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" '
-               'font-size="11.5" fill="#8b949e"><tspan fill="#58a6ff">Stack:</tspan> '
-               '<tspan fill="#ff7b72">Rust</tspan> · <tspan fill="#3fb950">Python</tspan> · '
-               '<tspan fill="#ffa657">Java</tspan> · <tspan fill="#58a6ff">Linux</tspan></text>')
-    svg.append('    </g>')
-
-    # Synchronized Blinking Monospace Cursor
-    # Travels across commands 1, 2, and 3
-    cursor_kt = [
-        0.00000, 0.01667, 0.06667, 0.17777,
-        0.17778, 0.19444, 0.28889, 0.41666,
-        0.41667, 0.43333, 0.52222, 0.97222,
-        1.00000
-    ]
-    cursor_x = [
-        170, 170, 218, 218,
-        170, 170, 328, 328,
-        170, 170, 308, 308,
-        170
-    ]
-    cursor_y = [
-        36, 36, 36, 36,
-        75, 75, 75, 75,
-        114, 114, 114, 114,
-        36
-    ]
-    c_kt_str = ";".join(f"{t:.5f}" for t in cursor_kt)
-    c_x_str = ";".join(str(x) for x in cursor_x)
-    c_y_str = ";".join(str(y) for y in cursor_y)
-
-    svg.append('    <!-- Terminal Blinking Cursor -->')
-    svg.append('    <rect x="170" y="36" width="7.5" height="13.5" rx="1" fill="#58a6ff" opacity="0.9">')
-    svg.append(f'      <animate attributeName="x" dur="{total_time:.2f}s" repeatCount="indefinite" '
-               f'calcMode="linear" keyTimes="{c_kt_str}" values="{c_x_str}"/>')
-    svg.append(f'      <animate attributeName="y" dur="{total_time:.2f}s" repeatCount="indefinite" '
-               f'calcMode="discrete" keyTimes="{c_kt_str}" values="{c_y_str}"/>')
-    svg.append('      <animate attributeName="opacity" dur="0.75s" repeatCount="indefinite" '
-               'values="1;1;0;0;1" keyTimes="0;0.48;0.52;0.96;1"/>')
-    svg.append('    </rect>')
-    svg.append('  </g>')
+    svg.extend(build_terminal(total_time))
 
     # ==========================================
-    # SECTION 2: MIDDLE RETRO HUD BAR (y=164..196)
-    # 100% Transparent Canvas: Floating retro displays
+    # SECTION 2: MIDDLE RETRO HUD BAR (y=192..213)
     # ==========================================
+    hud_y = 207
     svg.append('  <!-- ================= RETRO HUD BAR ================= -->')
     svg.append('  <g id="hud-bar">')
     # Score label
-    svg.append('    <text x="24" y="184" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" '
-               'font-size="12" font-weight="bold" fill="#8b949e">SCORE:</text>')
+    svg.append(f'    <text x="24" y="{hud_y}" {FONT} font-size="12" font-weight="bold" fill="#8b949e">SCORE:</text>')
 
     # Score Value Multi-state (+100 per apple)
-    # Render discrete score nodes for 0000, 0100, 0200, ...
     eat_steps = [app["eat_step"] for app in apple_events]
     total_apples = len(apple_events)
 
     for score_idx in range(total_apples + 1):
         score_val = f"{score_idx * 100:04d}"
         if score_idx == 0:
-            t_start = 0.0
             t_end = eat_steps[0] / total_steps
             s_kt = [0.0, t_end, 1.0]
             s_op = ["1", "0", "0"]
@@ -553,19 +557,15 @@ def build_svg(sim_data, total_duration=18.0):
             s_kt = [0.0, t_start, 1.0]
             s_op = ["0", "1", "1"]
 
-        s_kt_str = ";".join(f"{t:.5f}" for t in s_kt)
-        s_op_str = ";".join(s_op)
+        svg.append(f'    <text x="82" y="{hud_y}" {FONT} font-size="13" font-weight="bold" fill="#39d353" opacity="0">'
+                   f'<animate attributeName="opacity" dur="{total_time:.2f}s" repeatCount="indefinite" '
+                   f'calcMode="discrete" keyTimes="{fmt_kt(s_kt)}" values="{";".join(s_op)}"/>{score_val}</text>')
 
-        svg.append(f'    <text x="82" y="184" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" '
-                   f'font-size="13" font-weight="bold" fill="#39d353" opacity="0">')
-        svg.append(f'      <animate attributeName="opacity" dur="{total_time:.2f}s" repeatCount="indefinite" '
-                   f'calcMode="discrete" keyTimes="{s_kt_str}" values="{s_op_str}"/>')
-        svg.append(f'      {score_val}')
-        svg.append('    </text>')
-
-    # Dynamic Status Telemetry Badge
+    # Dynamic Status Telemetry Badge (right-aligned with the arena edge)
+    badge_w = 240
+    badge_x = ARENA_X + ARENA_W - badge_w
     svg.append('    <!-- Status Telemetry Badge Container -->')
-    svg.append('    <rect x="235" y="169" width="280" height="22" rx="4" ry="4" '
+    svg.append(f'    <rect x="{badge_x}" y="{hud_y - 15}" width="{badge_w}" height="21" rx="4" ry="4" '
                'fill="#161b22" fill-opacity="0.85" stroke="#30363d" stroke-width="1"/>')
 
     # Compress status intervals
@@ -583,7 +583,9 @@ def build_svg(sim_data, total_duration=18.0):
     if curr_status is not None:
         intervals.append((start_s, total_steps, curr_status[0], curr_status[1]))
 
-    for idx, (int_start, int_end, st_type, st_label) in enumerate(intervals):
+    for int_start, int_end, st_type, st_label in intervals:
+        if int_end <= int_start:
+            continue
         f_start = int_start / total_steps
         f_end = int_end / total_steps
 
@@ -596,9 +598,6 @@ def build_svg(sim_data, total_duration=18.0):
         else:
             st_kt = [0.0, f_start, f_end, 1.0]
             st_op = ["0", "1", "0", "0"]
-
-        st_kt_str = ";".join(f"{t:.5f}" for t in st_kt)
-        st_op_str = ";".join(st_op)
 
         # Theme color per status
         if st_type == "EVADE":
@@ -614,23 +613,15 @@ def build_svg(sim_data, total_duration=18.0):
             txt_color = "#3fb950"
             badge_icon = "● "
 
-        svg.append(f'    <g opacity="0">')
-        svg.append(f'      <animate attributeName="opacity" dur="{total_time:.2f}s" repeatCount="indefinite" '
-                   f'calcMode="discrete" keyTimes="{st_kt_str}" values="{st_op_str}"/>')
-        svg.append(f'      <text x="375" y="184" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" '
-                   f'font-size="10.5" font-weight="bold" fill="{txt_color}" text-anchor="middle">'
+        svg.append(f'    <text x="{badge_x + badge_w / 2:.1f}" y="{hud_y - 1}" {FONT} font-size="10.5" font-weight="bold" '
+                   f'fill="{txt_color}" text-anchor="middle" opacity="0">'
+                   f'<animate attributeName="opacity" dur="{total_time:.2f}s" repeatCount="indefinite" '
+                   f'calcMode="discrete" keyTimes="{fmt_kt(st_kt)}" values="{";".join(st_op)}"/>'
                    f'{badge_icon}{st_label}</text>')
-        svg.append('    </g>')
-
-    # Match Seed Indicator
-    svg.append(f'    <text x="725" y="184" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" '
-               f'font-size="11" text-anchor="end">')
-    svg.append(f'      <tspan fill="#8b949e">SEED: </tspan><tspan fill="#58a6ff" font-weight="bold">#{seed}</tspan>')
-    svg.append('    </text>')
     svg.append('  </g>')
 
     # ==========================================
-    # SECTION 3: LOWER SNAKE ARENA (y=202..388)
+    # SECTION 3: LOWER SNAKE ARENA (y=219..390)
     # 100% Transparent Canvas: Grid dots and frame border with fill="none"
     # ==========================================
     svg.append('  <!-- ================= SNAKE ARENA ================= -->')
@@ -639,7 +630,7 @@ def build_svg(sim_data, total_duration=18.0):
     svg.append(f'    <rect x="{ARENA_X}" y="{ARENA_Y}" width="{ARENA_W}" height="{ARENA_H}" rx="8" ry="8" '
                f'fill="none" stroke="#30363d" stroke-width="1"/>')
 
-    # Subtle Grid Crosses / Dots
+    # Subtle Grid Dots
     svg.append('    <g id="grid-dots" fill="#30363d" opacity="0.35">')
     for c in range(1, GRID_W):
         for r in range(1, GRID_H):
@@ -670,13 +661,10 @@ def build_svg(sim_data, total_duration=18.0):
             app_kt = [0.0, sp_f, et_f, 1.0]
             app_op = ["0", "1", "0", "0"]
 
-        app_kt_str = ";".join(f"{t:.5f}" for t in app_kt)
-        app_op_str = ";".join(app_op)
-
         svg.append(f'      <!-- Apple #{idx} ({color}) at ({ax}, {ay}) -->')
         svg.append(f'      <g id="apple-{idx}" opacity="0">')
         svg.append(f'        <animate attributeName="opacity" dur="{total_time:.2f}s" repeatCount="indefinite" '
-                   f'calcMode="discrete" keyTimes="{app_kt_str}" values="{app_op_str}"/>')
+                   f'calcMode="discrete" keyTimes="{fmt_kt(app_kt)}" values="{";".join(app_op)}"/>')
         # Apple Body with Pulsing SMIL
         svg.append(f'        <circle cx="{cx:.1f}" cy="{cy:.1f}" r="7.0" fill="{color}">')
         svg.append(f'          <animate attributeName="r" values="6.4;7.8;6.4" dur="0.85s" repeatCount="indefinite"/>')
@@ -694,8 +682,7 @@ def build_svg(sim_data, total_duration=18.0):
         b_end = min(1.0, b_start + burst_dur)
         eps = 0.00001
 
-        b_kt = [0.0, max(0.0, b_start - eps), b_start, b_end, 1.0]
-        b_kt_str = ";".join(f"{t:.5f}" for t in b_kt)
+        b_kt_str = fmt_kt([0.0, max(0.0, b_start - eps), b_start, b_end, 1.0])
 
         # Expanding Shockwave Ring
         svg.append(f'      <!-- Burst Ring Apple #{idx} -->')
@@ -709,14 +696,12 @@ def build_svg(sim_data, total_duration=18.0):
         svg.append('      </circle>')
 
         # Floating +100 Score Popup at Apple coordinates
-        svg.append(f'      <text x="{cx:.1f}" y="{cy:.1f}" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" '
-                   f'font-size="10.5" font-weight="bold" fill="{color}" text-anchor="middle" opacity="0">')
+        svg.append(f'      <text x="{cx:.1f}" y="{cy:.1f}" {FONT} font-size="10.5" font-weight="bold" '
+                   f'fill="{color}" text-anchor="middle" opacity="0">')
         svg.append(f'        <animate attributeName="y" dur="{total_time:.2f}s" repeatCount="indefinite" '
                    f'keyTimes="{b_kt_str}" values="{cy:.1f};{cy:.1f};{cy:.1f};{cy-14.0:.1f};{cy-14.0:.1f}"/>')
         svg.append(f'        <animate attributeName="opacity" dur="{total_time:.2f}s" repeatCount="indefinite" '
-                   f'keyTimes="{b_kt_str}" values="0;0;1.0;0;0"/>')
-        svg.append(f'        +100')
-        svg.append('      </text>')
+                   f'keyTimes="{b_kt_str}" values="0;0;1.0;0;0"/>+100</text>')
 
         # 4 Kinetic Spark Particles
         particle_vectors = [(13, 0), (-13, 0), (0, 13), (0, -13)]
@@ -735,63 +720,42 @@ def build_svg(sim_data, total_duration=18.0):
             svg.append('      </circle>')
 
     # --- 2. NEON PATROL DRONES (Alpha & Beta) ---
-    # Drone Alpha: Vertical sentinel
-    d_alpha_coords = []
-    for k in range(total_steps + 1):
-        col, row = drone_alpha_pos(k, d_alpha_col)
-        px = GRID_ORIGIN_X + col * CELL_SIZE + CELL_SIZE / 2
-        py = GRID_ORIGIN_Y + row * CELL_SIZE + CELL_SIZE / 2
-        d_alpha_coords.append(f"{px:.1f},{py:.1f}")
-    d_alpha_trans_str = ";".join(d_alpha_coords)
+    # Wings stay within 12.2px of the centre, so they never reach a neighbouring cell's segment.
+    drones = [
+        ("alpha", "Vertical", "#ff5f56", "#ff7b72", lambda k: drone_alpha_pos(k, d_alpha_col),
+         '<polygon points="0,-8 8,0 0,8 -8,0" fill="#161b22" stroke="#ff5f56" stroke-width="1.6"/>',
+         [(-10, 0), (10, 0)]),
+        ("beta", "Horizontal", "#58a6ff", "#79c0ff", lambda k: drone_beta_pos(k, d_beta_row),
+         '<polygon points="-8,-4 0,-8 8,-4 8,4 0,8 -8,4" fill="#161b22" stroke="#58a6ff" stroke-width="1.6"/>',
+         [(0, -10), (0, 10)]),
+    ]
+    for name, kind, color, core, pos_fn, hull, wings in drones:
+        coords = []
+        for k in range(total_steps + 1):
+            col, row = pos_fn(k)
+            px = GRID_ORIGIN_X + col * CELL_SIZE + CELL_SIZE / 2
+            py = GRID_ORIGIN_Y + row * CELL_SIZE + CELL_SIZE / 2
+            coords.append(f"{px:.1f},{py:.1f}")
 
-    svg.append('      <!-- Drone Alpha (Vertical Sentinel) -->')
-    svg.append(f'      <g id="drone-alpha" filter="url(#glow-drone-alpha)">')
-    svg.append(f'        <animateTransform attributeName="transform" type="translate" dur="{total_time:.2f}s" '
-               f'repeatCount="indefinite" calcMode="linear" keyTimes="{key_times_str}" values="{d_alpha_trans_str}"/>')
-    # Radar Pulsing Ring
-    svg.append('        <circle cx="0" cy="0" r="14" fill="none" stroke="#ff5f56" stroke-width="1.2" '
-               'stroke-dasharray="3,3" opacity="0.6">')
-    svg.append('          <animate attributeName="r" values="9;19;9" dur="1.8s" repeatCount="indefinite"/>')
-    svg.append('          <animate attributeName="opacity" values="0.8;0.1;0.8" dur="1.8s" repeatCount="indefinite"/>')
-    svg.append('        </circle>')
-    # Drone Hull & Wings
-    svg.append('        <polygon points="0,-8 8,0 0,8 -8,0" fill="#161b22" stroke="#ff5f56" stroke-width="1.6"/>')
-    svg.append('        <circle cx="0" cy="0" r="2.8" fill="#ff7b72"/>')
-    svg.append('        <line x1="-12" y1="0" x2="12" y2="0" stroke="#ff5f56" stroke-width="1.2" stroke-linecap="round"/>')
-    svg.append('        <circle cx="-12" cy="0" r="2.2" fill="#ff5f56"/>')
-    svg.append('        <circle cx="12" cy="0" r="2.2" fill="#ff5f56"/>')
-    svg.append('        <text x="0" y="-11" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" '
-               'font-size="7.5" font-weight="bold" fill="#ff7b72" text-anchor="middle">DRONE-α</text>')
-    svg.append('      </g>')
-
-    # Drone Beta: Horizontal sentinel
-    d_beta_coords = []
-    for k in range(total_steps + 1):
-        col, row = drone_beta_pos(k, d_beta_row)
-        px = GRID_ORIGIN_X + col * CELL_SIZE + CELL_SIZE / 2
-        py = GRID_ORIGIN_Y + row * CELL_SIZE + CELL_SIZE / 2
-        d_beta_coords.append(f"{px:.1f},{py:.1f}")
-    d_beta_trans_str = ";".join(d_beta_coords)
-
-    svg.append('      <!-- Drone Beta (Horizontal Sentinel) -->')
-    svg.append(f'      <g id="drone-beta" filter="url(#glow-drone-beta)">')
-    svg.append(f'        <animateTransform attributeName="transform" type="translate" dur="{total_time:.2f}s" '
-               f'repeatCount="indefinite" calcMode="linear" keyTimes="{key_times_str}" values="{d_beta_trans_str}"/>')
-    # Radar Pulsing Ring
-    svg.append('        <circle cx="0" cy="0" r="14" fill="none" stroke="#58a6ff" stroke-width="1.2" '
-               'stroke-dasharray="3,3" opacity="0.6">')
-    svg.append('          <animate attributeName="r" values="9;19;9" dur="1.8s" repeatCount="indefinite"/>')
-    svg.append('          <animate attributeName="opacity" values="0.8;0.1;0.8" dur="1.8s" repeatCount="indefinite"/>')
-    svg.append('        </circle>')
-    # Drone Hull & Wings
-    svg.append('        <polygon points="-8,-4 0,-8 8,-4 8,4 0,8 -8,4" fill="#161b22" stroke="#58a6ff" stroke-width="1.6"/>')
-    svg.append('        <circle cx="0" cy="0" r="2.8" fill="#79c0ff"/>')
-    svg.append('        <line x1="0" y1="-12" x2="0" y2="12" stroke="#58a6ff" stroke-width="1.2" stroke-linecap="round"/>')
-    svg.append('        <circle cx="0" cy="-12" r="2.2" fill="#58a6ff"/>')
-    svg.append('        <circle cx="0" cy="12" r="2.2" fill="#58a6ff"/>')
-    svg.append('        <text x="0" y="-11" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" '
-               'font-size="7.5" font-weight="bold" fill="#58a6ff" text-anchor="middle">DRONE-β</text>')
-    svg.append('      </g>')
+        (w1x, w1y), (w2x, w2y) = wings
+        svg.append(f'      <!-- Drone {name.capitalize()} ({kind} Sentinel) -->')
+        svg.append(f'      <g id="drone-{name}" filter="url(#glow-drone-{name})">')
+        svg.append(f'        <animateTransform attributeName="transform" type="translate" dur="{total_time:.2f}s" '
+                   f'repeatCount="indefinite" calcMode="linear" keyTimes="{key_times_str}" values="{";".join(coords)}"/>')
+        # Radar Pulsing Ring
+        svg.append(f'        <circle cx="0" cy="0" r="14" fill="none" stroke="{color}" stroke-width="1.2" '
+                   'stroke-dasharray="3,3" opacity="0.6">')
+        svg.append('          <animate attributeName="r" values="9;17;9" dur="1.8s" repeatCount="indefinite"/>')
+        svg.append('          <animate attributeName="opacity" values="0.8;0.1;0.8" dur="1.8s" repeatCount="indefinite"/>')
+        svg.append('        </circle>')
+        # Drone Hull & Wings
+        svg.append(f'        {hull}')
+        svg.append(f'        <circle cx="0" cy="0" r="2.8" fill="{core}"/>')
+        svg.append(f'        <line x1="{w1x}" y1="{w1y}" x2="{w2x}" y2="{w2y}" stroke="{color}" stroke-width="1.2" '
+                   'stroke-linecap="round"/>')
+        svg.append(f'        <circle cx="{w1x}" cy="{w1y}" r="2.2" fill="{color}"/>')
+        svg.append(f'        <circle cx="{w2x}" cy="{w2y}" r="2.2" fill="{color}"/>')
+        svg.append('      </g>')
 
     # --- 3. SNAKE BODY SEGMENTS (Rendered Tail to Head) ---
     max_segments = max(len(s) for s in history)
@@ -809,35 +773,23 @@ def build_svg(sim_data, total_duration=18.0):
 
         for k in range(total_steps + 1):
             snake_k = history[k]
-            if s < len(snake_k):
-                cell_x, cell_y = snake_k[s]
-                px_x = GRID_ORIGIN_X + cell_x * CELL_SIZE + OFFSET
-                px_y = GRID_ORIGIN_Y + cell_y * CELL_SIZE + OFFSET
-                x_vals.append(f"{px_x:.1f}")
-                y_vals.append(f"{px_y:.1f}")
-                opac_vals.append("1")
-            else:
-                cell_x, cell_y = snake_k[-1]
-                px_x = GRID_ORIGIN_X + cell_x * CELL_SIZE + OFFSET
-                px_y = GRID_ORIGIN_Y + cell_y * CELL_SIZE + OFFSET
-                x_vals.append(f"{px_x:.1f}")
-                y_vals.append(f"{px_y:.1f}")
-                opac_vals.append("0")
+            # Not-yet-grown segments wait hidden on the tail
+            cell_x, cell_y = snake_k[s] if s < len(snake_k) else snake_k[-1]
+            x_vals.append(f"{GRID_ORIGIN_X + cell_x * CELL_SIZE + OFFSET:.1f}")
+            y_vals.append(f"{GRID_ORIGIN_Y + cell_y * CELL_SIZE + OFFSET:.1f}")
+            opac_vals.append("1" if s < len(snake_k) else "0")
 
-        x_str = ";".join(x_vals)
-        y_str = ";".join(y_vals)
-        opac_str = ";".join(opac_vals)
         rx = "6" if s == 0 else "4.5"
 
         svg.append(f'      <!-- Snake Segment #{s} ({seg_color}) -->')
         svg.append(f'      <rect width="{SEG_SIZE}" height="{SEG_SIZE}" rx="{rx}" ry="{rx}" '
                    f'fill="{seg_color}" filter="url(#glow-snake)">')
         svg.append(f'        <animate attributeName="x" dur="{total_time:.2f}s" repeatCount="indefinite" '
-                   f'calcMode="linear" keyTimes="{key_times_str}" values="{x_str}"/>')
+                   f'calcMode="linear" keyTimes="{key_times_str}" values="{";".join(x_vals)}"/>')
         svg.append(f'        <animate attributeName="y" dur="{total_time:.2f}s" repeatCount="indefinite" '
-                   f'calcMode="linear" keyTimes="{key_times_str}" values="{y_str}"/>')
+                   f'calcMode="linear" keyTimes="{key_times_str}" values="{";".join(y_vals)}"/>')
         svg.append(f'        <animate attributeName="opacity" dur="{total_time:.2f}s" repeatCount="indefinite" '
-                   f'calcMode="discrete" keyTimes="{key_times_str}" values="{opac_str}"/>')
+                   f'calcMode="discrete" keyTimes="{key_times_str}" values="{";".join(opac_vals)}"/>')
         svg.append('      </rect>')
 
     # --- 4. SNAKE DIRECTIONAL EYES & PUPILS ---
@@ -847,13 +799,11 @@ def build_svg(sim_data, total_duration=18.0):
     pup2_x, pup2_y = [], []
 
     for k in range(total_steps + 1):
-        snake_k = history[k]
-        hx, hy = snake_k[0]
-        if k < total_steps:
-            nhx, nhy = history[k + 1][0]
-            dx, dy = nhx - hx, nhy - hy
-        else:
-            dx, dy = 1, 0 # exiting right
+        hx, hy = history[k][0]
+        nhx, nhy = history[k + 1][0] if k < total_steps else (hx + 1, hy)
+        dx, dy = nhx - hx, nhy - hy
+        if (dx, dy) == (0, 0):
+            dx, dy = 1, 0 # parked off-screen after exiting right
 
         bx = GRID_ORIGIN_X + hx * CELL_SIZE
         by = GRID_ORIGIN_Y + hy * CELL_SIZE
@@ -888,35 +838,18 @@ def build_svg(sim_data, total_duration=18.0):
         pup2_x.append(f"{p2[0]:.1f}")
         pup2_y.append(f"{p2[1]:.1f}")
 
-    # Eye 1 & Pupil 1
-    svg.append('      <!-- Snake Eye 1 & Pupil 1 -->')
-    svg.append('      <circle r="2.4" fill="#ffffff">')
-    svg.append(f'        <animate attributeName="cx" dur="{total_time:.2f}s" repeatCount="indefinite" '
-               f'calcMode="linear" keyTimes="{key_times_str}" values="{";".join(eye1_x)}"/>')
-    svg.append(f'        <animate attributeName="cy" dur="{total_time:.2f}s" repeatCount="indefinite" '
-               f'calcMode="linear" keyTimes="{key_times_str}" values="{";".join(eye1_y)}"/>')
-    svg.append('      </circle>')
-    svg.append('      <circle r="1.3" fill="#0d1117">')
-    svg.append(f'        <animate attributeName="cx" dur="{total_time:.2f}s" repeatCount="indefinite" '
-               f'calcMode="linear" keyTimes="{key_times_str}" values="{";".join(pup1_x)}"/>')
-    svg.append(f'        <animate attributeName="cy" dur="{total_time:.2f}s" repeatCount="indefinite" '
-               f'calcMode="linear" keyTimes="{key_times_str}" values="{";".join(pup1_y)}"/>')
-    svg.append('      </circle>')
-
-    # Eye 2 & Pupil 2
-    svg.append('      <!-- Snake Eye 2 & Pupil 2 -->')
-    svg.append('      <circle r="2.4" fill="#ffffff">')
-    svg.append(f'        <animate attributeName="cx" dur="{total_time:.2f}s" repeatCount="indefinite" '
-               f'calcMode="linear" keyTimes="{key_times_str}" values="{";".join(eye2_x)}"/>')
-    svg.append(f'        <animate attributeName="cy" dur="{total_time:.2f}s" repeatCount="indefinite" '
-               f'calcMode="linear" keyTimes="{key_times_str}" values="{";".join(eye2_y)}"/>')
-    svg.append('      </circle>')
-    svg.append('      <circle r="1.3" fill="#0d1117">')
-    svg.append(f'        <animate attributeName="cx" dur="{total_time:.2f}s" repeatCount="indefinite" '
-               f'calcMode="linear" keyTimes="{key_times_str}" values="{";".join(pup2_x)}"/>')
-    svg.append(f'        <animate attributeName="cy" dur="{total_time:.2f}s" repeatCount="indefinite" '
-               f'calcMode="linear" keyTimes="{key_times_str}" values="{";".join(pup2_y)}"/>')
-    svg.append('      </circle>')
+    for n, (xs, ys, r, fill) in enumerate([
+        (eye1_x, eye1_y, "2.4", "#ffffff"), (pup1_x, pup1_y, "1.3", "#0d1117"),
+        (eye2_x, eye2_y, "2.4", "#ffffff"), (pup2_x, pup2_y, "1.3", "#0d1117"),
+    ]):
+        if n % 2 == 0:
+            svg.append(f'      <!-- Snake Eye {n // 2 + 1} & Pupil {n // 2 + 1} -->')
+        svg.append(f'      <circle r="{r}" fill="{fill}">')
+        svg.append(f'        <animate attributeName="cx" dur="{total_time:.2f}s" repeatCount="indefinite" '
+                   f'calcMode="linear" keyTimes="{key_times_str}" values="{";".join(xs)}"/>')
+        svg.append(f'        <animate attributeName="cy" dur="{total_time:.2f}s" repeatCount="indefinite" '
+                   f'calcMode="linear" keyTimes="{key_times_str}" values="{";".join(ys)}"/>')
+        svg.append('      </circle>')
 
     svg.append('    </g>') # End arena clip
     svg.append('  </g>')   # End snake arena
@@ -951,7 +884,7 @@ def validate_svg(svg_content):
         w = elem.get("width", "")
         h = elem.get("height", "")
         fill = elem.get("fill", "")
-        if (w in ["100%", "750", "600"] or h in ["100%", "400", "200"]) and fill not in ["none", ""]:
+        if (w in ["100%", str(VIEW_W)] or h in ["100%", str(VIEW_H)]) and fill not in ["none", ""]:
             raise ValueError(f"Transparency violation: Found canvas-filling rect with fill='{fill}'!")
 
     return True
@@ -1004,15 +937,11 @@ def main():
         parser.error("--apples must be at least 1")
 
     # Determine seed
-    if args.hourly:
+    if args.hourly or args.seed is None:
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         seed = int(now_utc.strftime("%Y%m%d%H"))
-    elif args.seed is not None:
-        seed = args.seed
     else:
-        # Fallback to current UTC hour seed
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        seed = int(now_utc.strftime("%Y%m%d%H"))
+        seed = args.seed
 
     print(f"[*] Simulating procedural match (Seed: #{seed}, Apples: {args.apples}, Loop: {args.duration:.1f}s)...")
     sim_data = simulate_match(seed, apple_count=args.apples)
